@@ -8,8 +8,10 @@ from pathlib import Path
 from datetime import datetime
 import yfinance as yf
 
-from strategy import rank_stocks, backtest_momentum, monte_carlo, position_size
-from universe import UNIVERSE, ALL_TICKERS, DEFAULT_CATEGORIES, tickers_for
+from strategy import (rank_stocks, backtest_momentum, monte_carlo, position_size,
+                      ls_score, generate_pairs, backtest_long_short)
+from universe import (UNIVERSE, ALL_TICKERS, DEFAULT_CATEGORIES, tickers_for,
+                      LS_SECTORS, INVERSE_ETFS, ls_tickers_for)
 import alpaca_client as ac
 
 DATA_FILE = Path(__file__).parent / "data" / "profile.json"
@@ -91,8 +93,8 @@ with st.sidebar:
 
     page = st.radio(
         "Navigate",
-        ["Overview", "Strategy Signals", "Backtest", "Monte Carlo",
-         "Trade Log", "Position Sizer", "Settings"],
+        ["Overview", "Strategy Signals", "L/S Pairs", "Backtest",
+         "Monte Carlo", "Trade Log", "Position Sizer", "Settings"],
         label_visibility="collapsed",
     )
 
@@ -302,98 +304,371 @@ elif page == "Strategy Signals":
         save_profile(profile)
 
 
+# ── L/S Pairs ─────────────────────────────────────────────────────────────────
+
+elif page == "L/S Pairs":
+    st.title("Long / Short Pairs")
+    st.caption(
+        "Sector-neutral pairs: LONG the strongest stock, SHORT the weakest, "
+        "within the same sector. You only need to be right about which company "
+        "beats the other — not the direction of the whole market."
+    )
+
+    st.info(
+        "**Margin account required for real shorting.** "
+        "If you don't have one, use the Inverse ETF column as a no-margin proxy for the short leg.",
+        icon="ℹ️",
+    )
+
+    all_ls_sectors = list(LS_SECTORS.keys())
+    selected_sectors = st.multiselect(
+        "Sectors to scan for pairs",
+        options=all_ls_sectors,
+        default=all_ls_sectors[:6],
+    )
+
+    if not selected_sectors:
+        st.warning("Select at least one sector.")
+        st.stop()
+
+    sector_map = {s: LS_SECTORS[s] for s in selected_sectors}
+    all_tickers = ls_tickers_for(selected_sectors)
+
+    with st.spinner(f"Scoring {len(all_tickers)} stocks and generating pairs..."):
+        from strategy import fetch_prices
+        prices = fetch_prices(all_tickers, period="2y")
+        prices.index = pd.DatetimeIndex(prices.index)
+        pairs = generate_pairs(sector_map, prices)
+
+    if not pairs:
+        st.warning("Not enough data to generate pairs. Try different sectors.")
+        st.stop()
+
+    # ── Summary metrics ───────────────────────────────────────────────────────
+    avg_spread_3m = np.mean([p["spread_3m"] for p in pairs])
+    positive_pairs = sum(1 for p in pairs if p["spread_3m"] > 0)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Pairs Generated", len(pairs))
+    c2.metric("Positive Spread (3M)", f"{positive_pairs}/{len(pairs)}")
+    c3.metric("Avg 3M Spread", f"{avg_spread_3m:+.1f}%")
+
+    st.divider()
+
+    # ── Pairs table ───────────────────────────────────────────────────────────
+    st.subheader("Current Pairs")
+    table_rows = []
+    for p in pairs:
+        inv_etf = INVERSE_ETFS.get(p["sector"], "—")
+        spread_color = "🟢" if p["spread_3m"] > 5 else ("🟡" if p["spread_3m"] > 0 else "🔴")
+        table_rows.append({
+            "Sector":         p["sector"],
+            "LONG":           p["long"],
+            "SHORT":          p["short"],
+            "Inverse ETF":    inv_etf,
+            "Long Score":     round(p["long_score"], 3),
+            "Short Score":    round(p["short_score"], 3),
+            "Spread 1M %":   f"{p['spread_1m']:+.1f}%",
+            "Spread 3M %":   f"{spread_color} {p['spread_3m']:+.1f}%",
+            "Long 12M %":    f"{p['long_12m']:+.0f}%",
+            "Short 12M %":   f"{p['short_12m']:+.0f}%",
+        })
+    st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── Individual pair deep-dive ──────────────────────────────────────────────
+    st.subheader("Pair Deep-Dive")
+    pair_labels = [f"{p['long']} vs {p['short']}  ({p['sector']})" for p in pairs]
+    selected_pair_label = st.selectbox("Select a pair to inspect", pair_labels)
+    selected_pair = pairs[pair_labels.index(selected_pair_label)]
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(f"### 🟢 LONG — {selected_pair['long']}")
+        st.metric("1M Return",  f"{selected_pair['long_1m']:+.1f}%")
+        st.metric("3M Return",  f"{selected_pair['long_3m']:+.1f}%")
+        st.metric("12M Return", f"{selected_pair['long_12m']:+.1f}%")
+        st.metric("L/S Score",  round(selected_pair["long_score"], 3))
+
+    with c2:
+        st.markdown(f"### 🔴 SHORT — {selected_pair['short']}")
+        st.metric("1M Return",  f"{selected_pair['short_1m']:+.1f}%")
+        st.metric("3M Return",  f"{selected_pair['short_3m']:+.1f}%")
+        st.metric("12M Return", f"{selected_pair['short_12m']:+.1f}%")
+        st.metric("L/S Score",  round(selected_pair["short_score"], 3))
+
+    # Spread curve
+    curve = selected_pair["spread_curve"]
+    if not curve.empty:
+        st.subheader("Spread Performance (Long − Short daily returns, compounded)")
+        st.caption("Above 100 = long leg outperformed short leg since start of chart")
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=curve.index, y=curve,
+            fill="tozeroy",
+            fillcolor="rgba(0,212,170,0.1)" if curve.iloc[-1] >= 100 else "rgba(255,75,75,0.1)",
+            line=dict(color="#00d4aa" if curve.iloc[-1] >= 100 else "#ff4b4b", width=2),
+            name="Spread",
+        ))
+        fig.add_hline(y=100, line_dash="dash", line_color="gray", annotation_text="Break-even")
+        fig.update_layout(
+            template="plotly_dark", paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+            yaxis_title="Cumulative Spread", xaxis_title="Date", height=340,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Price chart: both legs
+    long_t  = selected_pair["long"]
+    short_t = selected_pair["short"]
+    if long_t in prices.columns and short_t in prices.columns:
+        st.subheader("Price History (normalised to 100)")
+        norm = prices[[long_t, short_t]].dropna()
+        norm = norm / norm.iloc[0] * 100
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=norm.index, y=norm[long_t],
+                                  line=dict(color="#00d4aa", width=2), name=f"LONG {long_t}"))
+        fig2.add_trace(go.Scatter(x=norm.index, y=norm[short_t],
+                                  line=dict(color="#ff4b4b", width=2), name=f"SHORT {short_t}"))
+        fig2.update_layout(
+            template="plotly_dark", paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+            yaxis_title="Price (normalised)", height=320,
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+    st.divider()
+
+    # ── Retail implementation guide ────────────────────────────────────────────
+    st.subheader("How to Trade This With $250")
+    inv_etf = INVERSE_ETFS.get(selected_pair["sector"], None)
+
+    tab1, tab2 = st.tabs(["Option A — Margin Account (true L/S)", "Option B — No Margin (ETF proxy)"])
+
+    with tab1:
+        st.markdown(f"""
+**Requirements:** Margin account (Robinhood Gold ~$5/mo, TD Ameritrade, or Alpaca Margin)
+
+| Leg | Action | Ticker | Suggested Allocation |
+|---|---|---|---|
+| Long | BUY | **{selected_pair['long']}** | $125 (50% of capital) |
+| Short | SELL SHORT | **{selected_pair['short']}** | $125 (50% of capital) |
+
+**How it works:**
+- Your gain/loss depends only on the *spread* between the two stocks
+- If the market crashes 20%, both legs fall — but your long loses less than your short gains
+- Maximum theoretical loss on short: unlimited (stock can rise indefinitely) — use a stop
+
+**Stop loss rule:** Close the short if it moves more than 15% against you.
+        """)
+
+    with tab2:
+        if inv_etf:
+            st.markdown(f"""
+**Requirements:** Just a regular brokerage (no margin needed)
+
+| Leg | Action | Ticker | Suggested Allocation |
+|---|---|---|---|
+| Long | BUY | **{selected_pair['long']}** | $175 (70% of capital) |
+| Short proxy | BUY | **{inv_etf}** *(inverse ETF)* | $75 (30% of capital) |
+
+**How it works:**
+- You *buy* the inverse ETF — it goes up when the sector goes down
+- This hedges your long position without needing a margin account
+- Less precise than a true short (tracks the whole sector, not one stock)
+- No unlimited loss risk — max loss is what you paid for each position
+            """)
+        else:
+            st.info("No inverse ETF mapped for this sector. Use Option A or buy SH (Short S&P 500) as a broad hedge.")
+
+
 # ── Backtest ──────────────────────────────────────────────────────────────────
 
 elif page == "Backtest":
     st.title("Strategy Backtest")
-    st.caption("Hold top N momentum stocks from selected universe, rebalance monthly — 5 year window")
 
-    all_cats = list(UNIVERSE.keys())
-    saved_cats = profile.get("selected_categories", DEFAULT_CATEGORIES)
-
-    col_a, col_b = st.columns([3, 1])
-    selected_cats = col_a.multiselect(
-        "Universe categories", options=all_cats, default=saved_cats
+    strategy_mode = st.radio(
+        "Strategy",
+        ["Long Only (Momentum)", "Long / Short (Market Neutral)"],
+        horizontal=True,
     )
-    top_n = col_b.number_input("Hold top N", min_value=1, max_value=20, value=5)
-
-    if not selected_cats:
-        st.warning("Select at least one category.")
-        st.stop()
-
-    tickers = tickers_for(selected_cats)
     capital = profile["starting_capital"]
-    st.caption(f"Backtesting across {len(tickers)} instruments")
 
-    with st.spinner("Running backtest (downloading 5 years of data)..."):
-        equity = backtest_momentum(tickers, top_n=int(top_n))
+    # ── Long Only ─────────────────────────────────────────────────────────────
+    if strategy_mode == "Long Only (Momentum)":
+        st.caption("Hold top N momentum stocks from selected universe, rebalance monthly — 5 year window")
 
-    if equity.empty or len(equity) < 5:
-        st.warning("Not enough data. Try adding more categories or check your internet connection.")
-        st.stop()
+        col_a, col_b = st.columns([3, 1])
+        selected_cats = col_a.multiselect(
+            "Universe categories", options=list(UNIVERSE.keys()),
+            default=profile.get("selected_categories", DEFAULT_CATEGORIES)
+        )
+        top_n = col_b.number_input("Hold top N", min_value=1, max_value=20, value=5)
 
-    equity = equity.dropna()
-    start_val  = equity.iloc[0]
-    end_val    = equity.iloc[-1]
-    total_ret  = (end_val - start_val) / start_val * 100 if start_val else 0.0
-    daily_rets = equity.pct_change().dropna()
-    sharpe     = (daily_rets.mean() / daily_rets.std()) * np.sqrt(252) if daily_rets.std() else 0.0
-    max_dd     = ((equity / equity.cummax()) - 1).min() * 100
-    ann_ret    = ((end_val / start_val) ** (252 / len(equity)) - 1) * 100 if start_val else 0.0
-    final_val  = capital * (1 + total_ret / 100)
+        if not selected_cats:
+            st.warning("Select at least one category.")
+            st.stop()
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Total Return",     f"{total_ret:.1f}%")
-    c2.metric("Ann. Return",      f"{ann_ret:.1f}%")
-    c3.metric("Sharpe Ratio",     f"{sharpe:.2f}")
-    c4.metric("Max Drawdown",     f"{max_dd:.1f}%")
-    c5.metric(f"${capital:.0f} → ", f"${final_val:,.2f}")
+        tickers = tickers_for(selected_cats)
+        st.caption(f"Universe: {len(tickers)} instruments")
 
-    scaled = equity / equity.iloc[0] * capital
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=equity.index, y=scaled,
-        fill="tozeroy", fillcolor="rgba(0,212,170,0.08)",
-        line=dict(color="#00d4aa", width=2), name="Strategy",
-    ))
-    fig.add_hline(y=capital, line_dash="dash", line_color="gray",
-                  annotation_text=f"Starting Capital ${capital:.0f}")
-    fig.update_layout(
-        template="plotly_dark", paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
-        title=f"Equity Curve — Top {top_n} Momentum, {len(selected_cats)} Categories",
-        yaxis_title="Portfolio Value ($)", xaxis_title="Date", height=420,
-    )
-    st.plotly_chart(fig, use_container_width=True)
+        with st.spinner("Running backtest..."):
+            equity = backtest_momentum(tickers, top_n=int(top_n))
 
-    st.subheader("Drawdown")
-    dd = ((equity / equity.cummax()) - 1) * 100
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(
-        x=dd.index, y=dd,
-        fill="tozeroy", fillcolor="rgba(255,75,75,0.12)",
-        line=dict(color="#ff4b4b", width=1.5), name="Drawdown %",
-    ))
-    fig2.update_layout(
-        template="plotly_dark", paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
-        yaxis_title="Drawdown %", height=280,
-    )
-    st.plotly_chart(fig2, use_container_width=True)
+        if equity.empty or len(equity) < 5:
+            st.warning("Not enough data.")
+            st.stop()
 
-    st.subheader("Rolling Sharpe (1-year window)")
-    roll_sharpe = daily_rets.rolling(252).apply(
-        lambda x: (x.mean() / x.std()) * np.sqrt(252) if x.std() else 0
-    )
-    fig3 = go.Figure()
-    fig3.add_trace(go.Scatter(
-        x=roll_sharpe.index, y=roll_sharpe,
-        line=dict(color="#ffd700", width=1.5), name="Rolling Sharpe",
-    ))
-    fig3.add_hline(y=1.0, line_dash="dot", line_color="gray", annotation_text="Sharpe = 1")
-    fig3.update_layout(
-        template="plotly_dark", paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
-        yaxis_title="Sharpe", height=260,
-    )
-    st.plotly_chart(fig3, use_container_width=True)
+        equity     = equity.dropna()
+        start_val  = equity.iloc[0]
+        end_val    = equity.iloc[-1]
+        total_ret  = (end_val - start_val) / start_val * 100 if start_val else 0.0
+        daily_rets = equity.pct_change().dropna()
+        sharpe     = (daily_rets.mean() / daily_rets.std()) * np.sqrt(252) if daily_rets.std() else 0.0
+        max_dd     = ((equity / equity.cummax()) - 1).min() * 100
+        ann_ret    = ((end_val / start_val) ** (252 / len(equity)) - 1) * 100 if start_val else 0.0
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Total Return",  f"{total_ret:.1f}%")
+        c2.metric("Ann. Return",   f"{ann_ret:.1f}%")
+        c3.metric("Sharpe Ratio",  f"{sharpe:.2f}")
+        c4.metric("Max Drawdown",  f"{max_dd:.1f}%")
+        c5.metric(f"${capital:.0f} →", f"${capital * (1 + total_ret/100):,.2f}")
+
+        scaled = equity / equity.iloc[0] * capital
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=equity.index, y=scaled, fill="tozeroy",
+                                 fillcolor="rgba(0,212,170,0.08)",
+                                 line=dict(color="#00d4aa", width=2), name="Long Only"))
+        fig.add_hline(y=capital, line_dash="dash", line_color="gray")
+        fig.update_layout(template="plotly_dark", paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+                          title="Long Only Equity Curve", yaxis_title="Portfolio Value ($)", height=400)
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ── Long / Short ──────────────────────────────────────────────────────────
+    else:
+        st.caption(
+            "Long top N + Short bottom N within each sector, rebalance monthly. "
+            "Market neutral — performance independent of broad market direction."
+        )
+
+        col_a, col_b = st.columns([3, 1])
+        selected_sectors = col_a.multiselect(
+            "Sectors", options=list(LS_SECTORS.keys()), default=list(LS_SECTORS.keys())[:6]
+        )
+        top_n = col_b.number_input("N per side", min_value=1, max_value=5, value=2)
+
+        if not selected_sectors:
+            st.warning("Select at least one sector.")
+            st.stop()
+
+        sector_map = {s: LS_SECTORS[s] for s in selected_sectors}
+        n_tickers  = len(ls_tickers_for(selected_sectors))
+        st.caption(f"Universe: {n_tickers} stocks across {len(selected_sectors)} sectors")
+
+        with st.spinner("Running Long/Short backtest (5 years of data)..."):
+            results = backtest_long_short(sector_map, top_n=int(top_n))
+
+        ls_eq   = results["ls"]
+        long_eq = results["long_only"]
+
+        if ls_eq.empty:
+            st.warning("Not enough data to run L/S backtest.")
+            st.stop()
+
+        def stats_from(eq: pd.Series, cap: float) -> dict:
+            eq = eq.dropna()
+            if len(eq) < 5:
+                return {}
+            s, e   = eq.iloc[0], eq.iloc[-1]
+            tot    = (e - s) / s * 100 if s else 0
+            dr     = eq.pct_change().dropna()
+            sharpe = (dr.mean() / dr.std()) * np.sqrt(252) if dr.std() else 0
+            dd     = ((eq / eq.cummax()) - 1).min() * 100
+            ann    = ((e / s) ** (252 / len(eq)) - 1) * 100 if s else 0
+            return {"total": tot, "ann": ann, "sharpe": sharpe, "dd": dd,
+                    "final": cap * (1 + tot / 100), "eq": eq, "dr": dr}
+
+        ls_s   = stats_from(ls_eq,   capital)
+        long_s = stats_from(long_eq, capital)
+
+        st.subheader("Long/Short (Market Neutral)")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Total Return",  f"{ls_s['total']:.1f}%")
+        c2.metric("Ann. Return",   f"{ls_s['ann']:.1f}%")
+        c3.metric("Sharpe Ratio",  f"{ls_s['sharpe']:.2f}")
+        c4.metric("Max Drawdown",  f"{ls_s['dd']:.1f}%")
+        c5.metric(f"${capital:.0f} →", f"${ls_s['final']:,.2f}")
+
+        fig = go.Figure()
+        ls_scaled   = ls_eq   / ls_eq.iloc[0]   * capital
+        long_scaled = long_eq / long_eq.iloc[0] * capital
+
+        fig.add_trace(go.Scatter(x=ls_scaled.index, y=ls_scaled,
+                                 line=dict(color="#00d4aa", width=2.5), name="L/S (Market Neutral)"))
+        fig.add_trace(go.Scatter(x=long_scaled.index, y=long_scaled,
+                                 line=dict(color="#60aaff", width=1.5, dash="dot"), name="Long Only (same universe)"))
+        fig.add_hline(y=capital, line_dash="dash", line_color="gray", annotation_text="Starting Capital")
+        fig.update_layout(
+            template="plotly_dark", paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+            title="Long/Short vs Long-Only Equity Curve",
+            yaxis_title="Portfolio Value ($)", xaxis_title="Date", height=420,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Drawdown comparison
+        st.subheader("Drawdown Comparison")
+        ls_dd   = ((ls_eq   / ls_eq.cummax())   - 1) * 100
+        long_dd = ((long_eq / long_eq.cummax()) - 1) * 100
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=ls_dd.index, y=ls_dd, fill="tozeroy",
+                                  fillcolor="rgba(0,212,170,0.1)",
+                                  line=dict(color="#00d4aa", width=1.5), name="L/S Drawdown"))
+        fig2.add_trace(go.Scatter(x=long_dd.index, y=long_dd,
+                                  line=dict(color="#60aaff", width=1.5, dash="dot"), name="Long Only Drawdown"))
+        fig2.update_layout(template="plotly_dark", paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+                           yaxis_title="Drawdown %", height=280)
+        st.plotly_chart(fig2, use_container_width=True)
+
+        # Stats table
+        st.subheader("Strategy Comparison")
+        comp = pd.DataFrame([
+            {"Strategy": "Long/Short (Market Neutral)",
+             "Total Return": f"{ls_s['total']:.1f}%",
+             "Ann. Return":  f"{ls_s['ann']:.1f}%",
+             "Sharpe":       f"{ls_s['sharpe']:.2f}",
+             "Max Drawdown": f"{ls_s['dd']:.1f}%",
+             f"${capital:.0f} → ": f"${ls_s['final']:,.2f}"},
+            {"Strategy": "Long Only",
+             "Total Return": f"{long_s.get('total', 0):.1f}%",
+             "Ann. Return":  f"{long_s.get('ann', 0):.1f}%",
+             "Sharpe":       f"{long_s.get('sharpe', 0):.2f}",
+             "Max Drawdown": f"{long_s.get('dd', 0):.1f}%",
+             f"${capital:.0f} → ": f"${long_s.get('final', capital):,.2f}"},
+        ])
+        st.dataframe(comp, use_container_width=True, hide_index=True)
+
+    # ── Drawdown & Rolling Sharpe (Long Only only) ────────────────────────────
+    if strategy_mode == "Long Only (Momentum)" and "daily_rets" in dir():
+        st.subheader("Drawdown")
+        dd = ((equity / equity.cummax()) - 1) * 100
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=dd.index, y=dd, fill="tozeroy",
+                                  fillcolor="rgba(255,75,75,0.12)",
+                                  line=dict(color="#ff4b4b", width=1.5), name="Drawdown %"))
+        fig2.update_layout(template="plotly_dark", paper_bgcolor="#0e1117",
+                           plot_bgcolor="#0e1117", yaxis_title="Drawdown %", height=260)
+        st.plotly_chart(fig2, use_container_width=True)
+
+        st.subheader("Rolling Sharpe (1-year window)")
+        roll_sharpe = daily_rets.rolling(252).apply(
+            lambda x: (x.mean() / x.std()) * np.sqrt(252) if x.std() else 0
+        )
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(x=roll_sharpe.index, y=roll_sharpe,
+                                  line=dict(color="#ffd700", width=1.5), name="Rolling Sharpe"))
+        fig3.add_hline(y=1.0, line_dash="dot", line_color="gray", annotation_text="Sharpe = 1")
+        fig3.update_layout(template="plotly_dark", paper_bgcolor="#0e1117",
+                           plot_bgcolor="#0e1117", yaxis_title="Sharpe", height=260)
+        st.plotly_chart(fig3, use_container_width=True)
 
 
 # ── Monte Carlo ───────────────────────────────────────────────────────────────
