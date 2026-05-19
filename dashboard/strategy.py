@@ -312,6 +312,139 @@ def backtest_long_short(
     return {"ls": ls_eq.dropna(), "long_only": long_eq.dropna()}
 
 
+# ── Additional backtest strategies ────────────────────────────────────────────
+
+def _calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain  = delta.clip(lower=0).rolling(period).mean()
+    loss  = (-delta.clip(upper=0)).rolling(period).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def backtest_mean_reversion(
+    tickers: list[str],
+    rsi_period: int = 14,
+    rsi_buy: float = 30,
+    rsi_sell: float = 70,
+    max_hold: int = 20,
+) -> dict:
+    """
+    Buy when RSI drops below rsi_buy, sell when RSI rises above rsi_sell
+    or after max_hold days. Equal-weight across all triggered positions.
+    """
+    prices = fetch_prices(tickers, period="5y")
+    prices = prices.dropna(axis=1, how="all").ffill()
+
+    daily_portfolio: list[pd.Series] = []
+
+    for ticker in prices.columns:
+        col = prices[ticker].dropna()
+        if len(col) < rsi_period + 10:
+            continue
+        rsi   = _calc_rsi(col, rsi_period)
+        in_position = False
+        hold_days   = 0
+        entry_price = 0.0
+        trade_rets: list[float] = [0.0] * len(col)
+
+        for i in range(rsi_period + 1, len(col)):
+            if not in_position:
+                if rsi.iloc[i] < rsi_buy:
+                    in_position  = True
+                    hold_days    = 0
+                    entry_price  = col.iloc[i]
+            else:
+                hold_days += 1
+                pnl = col.iloc[i] / col.iloc[i - 1] - 1
+                trade_rets[i] = pnl
+                if rsi.iloc[i] > rsi_sell or hold_days >= max_hold:
+                    in_position = False
+
+        s = pd.Series(trade_rets, index=col.index)
+        daily_portfolio.append(s)
+
+    if not daily_portfolio:
+        return {"equity": pd.Series(dtype=float), "trades": 0}
+
+    combined = pd.concat(daily_portfolio, axis=1).mean(axis=1).dropna()
+    equity   = (1 + combined).cumprod() * 100
+    return {"equity": equity.dropna(), "label": "Mean Reversion (RSI)"}
+
+
+def backtest_sma_cross(
+    tickers: list[str],
+    fast: int = 50,
+    slow: int = 200,
+) -> dict:
+    """
+    Golden Cross / Death Cross: buy when fast SMA crosses above slow SMA,
+    sell when it crosses back below.
+    """
+    prices = fetch_prices(tickers, period="5y")
+    prices = prices.dropna(axis=1, how="all").ffill()
+
+    daily_portfolio: list[pd.Series] = []
+
+    for ticker in prices.columns:
+        col = prices[ticker].dropna()
+        if len(col) < slow + 10:
+            continue
+        sma_fast = col.rolling(fast).mean()
+        sma_slow = col.rolling(slow).mean()
+        signal   = (sma_fast > sma_slow).astype(int)
+        # 1 when in position, 0 when out — shift by 1 to avoid look-ahead
+        position = signal.shift(1).fillna(0)
+        daily_ret = col.pct_change() * position
+        daily_portfolio.append(daily_ret)
+
+    if not daily_portfolio:
+        return {"equity": pd.Series(dtype=float)}
+
+    combined = pd.concat(daily_portfolio, axis=1).mean(axis=1).dropna()
+    equity   = (1 + combined).cumprod() * 100
+    return {"equity": equity.dropna(), "label": f"SMA Cross ({fast}/{slow})"}
+
+
+def backtest_buy_hold(tickers: list[str]) -> dict:
+    """Equal-weight buy & hold — the simplest benchmark."""
+    prices = fetch_prices(tickers, period="5y")
+    prices = prices.dropna(axis=1, how="all").ffill()
+    combined = prices.pct_change().dropna().mean(axis=1)
+    equity   = (1 + combined).cumprod() * 100
+    return {"equity": equity.dropna(), "label": "Buy & Hold (Equal Weight)"}
+
+
+def backtest_spy_benchmark() -> dict:
+    """SPY as the market benchmark."""
+    col = fetch_prices(["SPY"], period="5y")["SPY"].dropna()
+    equity = (1 + col.pct_change().dropna()).cumprod() * 100
+    return {"equity": equity.dropna(), "label": "SPY Benchmark"}
+
+
+def equity_stats(equity: pd.Series, capital: float = 100) -> dict:
+    """Compute standard performance statistics from an equity curve."""
+    eq = equity.dropna()
+    if len(eq) < 5:
+        return {}
+    s, e       = eq.iloc[0], eq.iloc[-1]
+    total_ret  = (e - s) / s * 100 if s else 0
+    ann_ret    = ((e / s) ** (252 / len(eq)) - 1) * 100 if s else 0
+    dr         = eq.pct_change().dropna()
+    sharpe     = (dr.mean() / dr.std()) * np.sqrt(252) if dr.std() else 0
+    max_dd     = ((eq / eq.cummax()) - 1).min() * 100
+    win_rate   = (dr > 0).mean() * 100
+    return {
+        "total_ret": round(total_ret, 1),
+        "ann_ret":   round(ann_ret, 1),
+        "sharpe":    round(sharpe, 2),
+        "max_dd":    round(max_dd, 1),
+        "win_rate":  round(win_rate, 1),
+        "final":     round(capital * (1 + total_ret / 100), 2),
+        "equity":    eq,
+    }
+
+
 def position_size(capital: float, risk_pct: float, entry: float, stop: float) -> dict:
     risk_dollars = capital * (risk_pct / 100)
     stop_distance = abs(entry - stop)

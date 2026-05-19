@@ -1,4 +1,6 @@
 {
+  "username": "trader",
+  "password_hash": "26088f7527885e5be0007523dc12f3fabd585501375a0b5744842e41dfd6e394",
   "name": "My Trading Dashboard",
   "starting_capital": 250.00,
   "current_cash": 250.00,
@@ -6,6 +8,7 @@
   "alpaca_api_key": "",
   "alpaca_secret_key": "",
   "alpaca_paper": true,
+  "anthropic_api_key": "",
   "watchlist": ["AAPL", "MSFT", "NVDA", "TSLA", "SPY"],
   "selected_categories": ["Mega Cap Tech", "Broad Market ETFs", "Sector ETFs", "Factor ETFs"],
   "risk_per_trade_pct": 2.0,
