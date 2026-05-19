@@ -1,0 +1,12 @@
+{
+  "name": "My Trading Dashboard",
+  "starting_capital": 250.00,
+  "current_cash": 250.00,
+  "broker": "Alpaca (Paper)",
+  "alpaca_api_key": "",
+  "alpaca_secret_key": "",
+  "alpaca_paper": true,
+  "watchlist": ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "SPY"],
+  "risk_per_trade_pct": 2.0,
+  "trades": []
+}
