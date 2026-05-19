@@ -28,9 +28,12 @@ def save_profile(profile: dict):
 
 def current_price(ticker: str) -> float:
     try:
-        return yf.Ticker(ticker).fast_info["last_price"]
+        hist = yf.Ticker(ticker).history(period="5d")
+        if not hist.empty:
+            return float(hist["Close"].iloc[-1])
     except Exception:
-        return 0.0
+        pass
+    return 0.0
 
 
 def portfolio_value(profile: dict) -> float:
@@ -164,10 +167,16 @@ if page == "Overview":
         snap_rows = []
         for t in tickers:
             try:
-                info = yf.Ticker(t).fast_info
-                price = info.get("last_price", 0)
-                prev  = info.get("previous_close", price)
-                chg   = price - prev
+                hist = yf.Ticker(t).history(period="5d")
+                if len(hist) >= 2:
+                    price = float(hist["Close"].iloc[-1])
+                    prev  = float(hist["Close"].iloc[-2])
+                elif len(hist) == 1:
+                    price = float(hist["Close"].iloc[-1])
+                    prev  = price
+                else:
+                    raise ValueError("no data")
+                chg     = price - prev
                 chg_pct = (chg / prev * 100) if prev else 0
                 snap_rows.append({"Ticker": t, "Price": f"${price:.2f}",
                                    "Change": f"${chg:+.2f}", "Change %": f"{chg_pct:+.2f}%"})
@@ -193,33 +202,38 @@ elif page == "Strategy Signals":
             return "background-color: #3d0000; color: #ff4b4b"
         return "background-color: #2e2a00; color: #ffd700"
 
-    styled = df[["Signal", "Combined Score", "1M Return %", "3M Return %", "12M Return %", "Quality Score"]].style.applymap(
+    styled = df[["Signal", "Combined Score", "1M Return %", "3M Return %", "12M Return %", "Quality Score"]].style.map(
         color_signal, subset=["Signal"]
     )
     st.dataframe(styled, use_container_width=True)
 
     st.divider()
     st.subheader("Score Breakdown")
+    df_reset = df.reset_index()  # "Ticker" becomes a column
+    ticker_col = df_reset.columns[0]  # first col is always the ticker
     fig = px.bar(
-        df.reset_index(),
-        x="index", y="Combined Score",
+        df_reset,
+        x=ticker_col, y="Combined Score",
         color="Signal",
         color_discrete_map={"BUY": "#00d4aa", "HOLD": "#ffd700", "AVOID": "#ff4b4b"},
-        labels={"index": "Ticker"},
+        labels={ticker_col: "Ticker"},
     )
     fig.update_layout(template="plotly_dark", plot_bgcolor="#0e1117", paper_bgcolor="#0e1117")
     st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Return Heatmap")
-    heatmap_df = df[["1M Return %", "3M Return %", "12M Return %"]].T
-    fig2 = px.imshow(
-        heatmap_df,
-        color_continuous_scale="RdYlGn",
-        color_continuous_midpoint=0,
-        aspect="auto",
-    )
-    fig2.update_layout(template="plotly_dark", paper_bgcolor="#0e1117")
-    st.plotly_chart(fig2, use_container_width=True)
+    ret_cols = [c for c in ["1M Return %", "3M Return %", "12M Return %"] if c in df.columns]
+    heatmap_df = df[ret_cols].dropna(axis=1, how="all").T
+    if not heatmap_df.empty:
+        fig2 = px.imshow(
+            heatmap_df,
+            color_continuous_scale="RdYlGn",
+            color_continuous_midpoint=0,
+            aspect="auto",
+            text_auto=".1f",
+        )
+        fig2.update_layout(template="plotly_dark", paper_bgcolor="#0e1117")
+        st.plotly_chart(fig2, use_container_width=True)
 
 
 # ── Backtest ─────────────────────────────────────────────────────────────────
@@ -235,14 +249,15 @@ elif page == "Backtest":
     with st.spinner("Running backtest..."):
         equity = backtest_momentum(tickers, top_n=top_n)
 
-    if equity.empty:
-        st.warning("Not enough data to run backtest.")
+    if equity.empty or len(equity) < 5:
+        st.warning("Not enough data to run backtest. Try adding more tickers to your watchlist.")
     else:
+        equity = equity.dropna()
         start_val = equity.iloc[0]
-        end_val = equity.iloc[-1]
-        total_ret = (end_val - start_val) / start_val * 100
+        end_val   = equity.iloc[-1]
+        total_ret = ((end_val - start_val) / start_val * 100) if start_val else 0.0
         daily_rets = equity.pct_change().dropna()
-        sharpe = (daily_rets.mean() / daily_rets.std()) * np.sqrt(252)
+        sharpe = (daily_rets.mean() / daily_rets.std()) * np.sqrt(252) if daily_rets.std() else 0.0
         max_dd = ((equity / equity.cummax()) - 1).min() * 100
 
         c1, c2, c3, c4 = st.columns(4)

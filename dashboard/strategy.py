@@ -6,7 +6,12 @@ from scipy import stats
 
 def fetch_prices(tickers: list[str], period: str = "1y") -> pd.DataFrame:
     data = yf.download(tickers, period=period, auto_adjust=True, progress=False)
-    return data["Close"] if isinstance(data.columns, pd.MultiIndex) else data
+    if isinstance(data.columns, pd.MultiIndex):
+        close = data["Close"]
+    else:
+        close = data
+    # ensure all columns are present even if some tickers had no data
+    return close.ffill().dropna(axis=1, how="all")
 
 
 def momentum_score(prices: pd.DataFrame) -> pd.Series:
@@ -16,18 +21,29 @@ def momentum_score(prices: pd.DataFrame) -> pd.Series:
     return (ret_12m - ret_1m).iloc[-1].sort_values(ascending=False)
 
 
-def quality_filter(tickers: list[str]) -> dict:
-    """Pull basic quality metrics via yfinance."""
+def quality_filter(tickers: list[str], prices: pd.DataFrame) -> dict:
+    """
+    Proxy quality score using price-derived volatility and trend consistency.
+    Lower 90-day volatility = more stable = higher quality proxy.
+    """
     scores = {}
     for t in tickers:
+        if t not in prices.columns:
+            scores[t] = 0
+            continue
         try:
-            info = yf.Ticker(t).info
-            de = info.get("debtToEquity", None)
-            roe = info.get("returnOnEquity", None)
+            col = prices[t].dropna()
+            if len(col) < 21:
+                scores[t] = 0
+                continue
+            vol_90 = col.pct_change().rolling(90).std().iloc[-1]
+            # count how many of the last 6 months were positive
+            monthly = col.resample("ME").last().pct_change().dropna()
+            positive_months = (monthly.tail(6) > 0).sum()
             score = 0
-            if de is not None and de < 100:
+            if vol_90 < 0.025:   # low daily vol = stable
                 score += 1
-            if roe is not None and roe > 0.10:
+            if positive_months >= 4:  # trending up consistently
                 score += 1
             scores[t] = score
         except Exception:
@@ -36,30 +52,40 @@ def quality_filter(tickers: list[str]) -> dict:
 
 
 def rank_stocks(tickers: list[str]) -> pd.DataFrame:
-    prices = fetch_prices(tickers)
+    prices = fetch_prices(tickers, period="2y")
+    prices.index = pd.DatetimeIndex(prices.index)
+
     mom = momentum_score(prices)
-    quality = quality_filter(tickers)
+    quality = quality_filter(tickers, prices)
 
     df = pd.DataFrame({
         "Momentum Score": mom,
-        "Quality Score": pd.Series(quality),
-    }).dropna()
+        "Quality Score": pd.Series(quality, dtype=float),
+    })
+    df.index.name = "Ticker"
+    df = df.dropna(subset=["Momentum Score"])
+    df["Quality Score"] = df["Quality Score"].fillna(0)
 
-    mom_z = stats.zscore(df["Momentum Score"])
-    qual_z = stats.zscore(df["Quality Score"])
+    if len(df) > 1:
+        mom_z = stats.zscore(df["Momentum Score"])
+        qual_z = stats.zscore(df["Quality Score"]) if df["Quality Score"].std() > 0 else np.zeros(len(df))
+    else:
+        mom_z = np.zeros(len(df))
+        qual_z = np.zeros(len(df))
+
     df["Combined Score"] = 0.7 * mom_z + 0.3 * qual_z
     df["Signal"] = df["Combined Score"].apply(
         lambda x: "BUY" if x > 0.5 else ("HOLD" if x > -0.5 else "AVOID")
     )
-    df["1M Return %"] = (prices.pct_change(21).iloc[-1] * 100).round(2)
-    df["3M Return %"] = (prices.pct_change(63).iloc[-1] * 100).round(2)
+    df["1M Return %"]  = (prices.pct_change(21).iloc[-1] * 100).round(2)
+    df["3M Return %"]  = (prices.pct_change(63).iloc[-1] * 100).round(2)
     df["12M Return %"] = (prices.pct_change(252).iloc[-1] * 100).round(2)
     return df.sort_values("Combined Score", ascending=False).round(3)
 
 
 def backtest_momentum(tickers: list[str], top_n: int = 3, rebalance_days: int = 21) -> pd.Series:
     """Simple backtest: hold top N momentum stocks, rebalance monthly."""
-    prices = fetch_prices(tickers, period="2y")
+    prices = fetch_prices(tickers, period="5y")
     prices = prices.dropna(axis=1, how="all").ffill()
 
     portfolio_returns = []
@@ -83,8 +109,9 @@ def backtest_momentum(tickers: list[str], top_n: int = 3, rebalance_days: int = 
     if not portfolio_returns:
         return pd.Series(dtype=float)
 
-    combined = pd.concat(portfolio_returns)
+    combined = pd.concat(portfolio_returns).dropna()
     equity = (1 + combined).cumprod() * 100
+    equity = equity.dropna()
     return equity
 
 
