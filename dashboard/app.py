@@ -98,6 +98,7 @@ NAV = {
     "RESEARCH":   ["Company Search", "Market Research", "AI Assistant"],
     "STRATEGY":   ["Strategy Signals", "L/S Pairs", "Strategy Overview"],
     "BACKTESTING":["Backtesting", "Monte Carlo"],
+    "AUTOMATION": ["Auto Trader"],
     "SYSTEM":     ["Settings"],
 }
 
@@ -1249,3 +1250,91 @@ The dashboard uses Claude Haiku (fast + cheap — ~$0.001 per message).
                 save_profile(profile)
                 st.success("Credentials updated! You'll need to log in again.")
                 logout()
+
+# ── Auto Trader ───────────────────────────────────────────────────────────────
+elif page == "Auto Trader":
+    st.title("🤖 Auto Trader")
+    st.caption("Momentum strategy — runs automatically via GitHub Actions every trading day.")
+
+    log_path = Path(__file__).parent / "data" / "auto_trade_log.json"
+
+    # ── Status card ───────────────────────────────────────────────────────────
+    col1, col2, col3 = st.columns(3)
+    if alpaca_acct:
+        col1.metric("Account Equity",   f"${alpaca_acct.equity:,.2f}")
+        col2.metric("Cash Available",   f"${alpaca_acct.cash:,.2f}")
+        col3.metric("Buying Power",     f"${alpaca_acct.buying_power:,.2f}")
+    else:
+        st.info("Connect your Alpaca API key in **Settings → Alpaca API** to see live data.")
+
+    st.divider()
+
+    # ── How it works ──────────────────────────────────────────────────────────
+    with st.expander("ℹ️ How the auto-trader works", expanded=False):
+        st.markdown("""
+**Schedule:** Runs automatically at **9:45 AM ET** and **1:00 PM ET** every weekday via GitHub Actions.
+
+**Strategy:** Quality Momentum — picks the top 5 stocks by 12-1 month momentum from your selected universe.
+
+**Rebalancing logic:**
+1. Calculates fresh momentum scores each run
+2. Closes any position that fell out of the top 5
+3. Buys equal dollar amounts of any new top-5 entry using available cash
+4. Keeps a 2% cash buffer at all times
+
+**To activate:** Add your Alpaca keys as GitHub Secrets (see setup guide below).
+        """)
+
+    # ── GitHub Secrets setup guide ────────────────────────────────────────────
+    with st.expander("⚙️ One-time setup: add your Alpaca keys to GitHub", expanded=True):
+        st.markdown("""
+**Do this once — takes 2 minutes:**
+
+1. Go to your GitHub repo → **Settings** → **Secrets and variables** → **Actions**
+2. Click **New repository secret**
+3. Add secret named `ALPACA_API_KEY` → paste your Alpaca API Key ID
+4. Add another secret named `ALPACA_SECRET_KEY` → paste your Alpaca Secret Key
+5. Done — the bot will trade automatically starting next market day
+
+Your keys are stored encrypted in GitHub and never appear in any log or code.
+        """)
+
+    st.divider()
+
+    # ── Trade log ─────────────────────────────────────────────────────────────
+    st.subheader("Auto-Trade Run History")
+
+    if not log_path.exists():
+        st.info("No auto-trade runs yet. The bot will execute its first run at 9:45 AM ET on the next trading day.")
+    else:
+        with open(log_path) as f:
+            runs = json.load(f)
+
+        if not runs:
+            st.info("No runs logged yet.")
+        else:
+            for run in reversed(runs[-20:]):
+                ts      = run.get("run_at", "")[:19].replace("T", " ")
+                equity  = run.get("equity", 0)
+                targets = run.get("targets", [])
+                actions = run.get("actions", [])
+                buys    = [a for a in actions if a["action"] == "BUY"  and a.get("success")]
+                sells   = [a for a in actions if a["action"] == "SELL" and a.get("success")]
+                errors  = [a for a in actions if not a.get("success")]
+
+                with st.expander(f"📅 {ts} UTC  |  equity ${equity:,.2f}  |  {len(buys)} buys · {len(sells)} sells"):
+                    st.markdown(f"**Target holdings:** {', '.join(targets)}")
+                    if buys:
+                        st.markdown("**Bought:**")
+                        for a in buys:
+                            st.markdown(f"- BUY **{a['ticker']}** — ${a.get('notional',0):.2f}")
+                    if sells:
+                        st.markdown("**Sold:**")
+                        for a in sells:
+                            st.markdown(f"- SELL all **{a['ticker']}** (value ~${a.get('value',0):.2f})")
+                    if errors:
+                        st.markdown("**Errors:**")
+                        for a in errors:
+                            st.error(f"{a['action']} {a['ticker']}: {a.get('error','unknown error')}")
+                    if not actions:
+                        st.success("No changes needed — already holding all targets.")

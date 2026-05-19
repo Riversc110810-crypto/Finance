@@ -1,0 +1,42 @@
+name: Auto Trader
+
+on:
+  schedule:
+    # 9:45 AM ET (14:45 UTC) — 15 min after market open, Mon–Fri
+    - cron: "45 14 * * 1-5"
+    # 1:00 PM ET (18:00 UTC) — midday rebalance check, Mon–Fri
+    - cron: "0 18 * * 1-5"
+  workflow_dispatch:  # also allows manual trigger from GitHub Actions tab
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to commit the trade log back
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r dashboard/requirements.txt
+
+      - name: Run auto-trader
+        env:
+          ALPACA_API_KEY:    ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_PAPER:      "true"
+        run: python dashboard/auto_trader.py
+
+      - name: Commit updated trade log
+        run: |
+          git config user.name  "Auto Trader Bot"
+          git config user.email "bot@trading-dashboard"
+          git add dashboard/data/auto_trade_log.json || true
+          git diff --staged --quiet || git commit -m "Auto-trade log $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
