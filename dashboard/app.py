@@ -97,7 +97,7 @@ NAV = {
     "PORTFOLIO":  ["Overview", "Trade Log", "Position Sizer"],
     "RESEARCH":   ["Company Search", "Market Research", "AI Assistant"],
     "STRATEGY":   ["Strategy Signals", "L/S Pairs", "Strategy Overview"],
-    "BACKTESTING":["Backtesting", "Monte Carlo"],
+    "BACKTESTING":["Backtesting", "Monte Carlo", "Crypto Monte Carlo"],
     "AUTOMATION": ["Auto Trader"],
     "SYSTEM":     ["Settings"],
 }
@@ -980,6 +980,217 @@ elif page == "Monte Carlo":
              "Multiple": f"{np.percentile(final_vals,p)/capital:.2f}x"}
             for p in [5,10,25,50,75,90,95]]
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+# ── Crypto Monte Carlo ────────────────────────────────────────────────────────
+elif page == "Crypto Monte Carlo":
+    st.title("₿ Crypto Monte Carlo")
+    st.caption("Probabilistic projection seeded from real crypto price history")
+
+    CRYPTO_UNIVERSE = {
+        "BTC-USD":  "Bitcoin",
+        "ETH-USD":  "Ethereum",
+        "SOL-USD":  "Solana",
+        "BNB-USD":  "BNB",
+        "XRP-USD":  "XRP",
+        "DOGE-USD": "Dogecoin",
+        "ADA-USD":  "Cardano",
+        "AVAX-USD": "Avalanche",
+        "LINK-USD": "Chainlink",
+        "DOT-USD":  "Polkadot",
+        "MATIC-USD":"Polygon",
+        "UNI-USD":  "Uniswap",
+        "LTC-USD":  "Litecoin",
+        "ATOM-USD": "Cosmos",
+        "NEAR-USD": "NEAR Protocol",
+    }
+
+    # ── Controls ──────────────────────────────────────────────────────────────
+    c1, c2 = st.columns([2, 1])
+    selected_cryptos = c1.multiselect(
+        "Select coins to simulate",
+        options=list(CRYPTO_UNIVERSE.keys()),
+        default=["BTC-USD", "ETH-USD", "SOL-USD"],
+        format_func=lambda x: f"{CRYPTO_UNIVERSE[x]} ({x.replace('-USD','')})"
+    )
+    period_map = {"1 Year": "1y", "2 Years": "2y", "3 Years": "3y", "5 Years": "5y"}
+    hist_period = c2.selectbox("History to seed from", list(period_map.keys()), index=1)
+
+    c1, c2, c3, c4 = st.columns(4)
+    capital  = c1.number_input("Starting Capital ($)", value=float(profile["starting_capital"]), step=10.0)
+    n_sims   = c2.slider("Simulations", 500, 5000, 2000, step=500)
+    days     = c3.slider("Days Forward", 30, 730, 365, step=30)
+    alloc_mode = c4.radio("Allocation", ["Equal Weight", "Custom"])
+
+    if not selected_cryptos:
+        st.warning("Select at least one coin.")
+        st.stop()
+
+    # ── Custom allocation ─────────────────────────────────────────────────────
+    allocs = {}
+    if alloc_mode == "Custom":
+        st.markdown("**Set allocation % (must sum to 100)**")
+        cols = st.columns(len(selected_cryptos))
+        total = 0
+        for i, ticker in enumerate(selected_cryptos):
+            default_pct = round(100 / len(selected_cryptos))
+            pct = cols[i].number_input(ticker.replace("-USD",""), 0, 100, default_pct, key=f"alloc_{ticker}")
+            allocs[ticker] = pct / 100
+            total += pct
+        if abs(total - 100) > 1:
+            st.error(f"Allocations sum to {total}% — must equal 100%")
+            st.stop()
+    else:
+        for t in selected_cryptos:
+            allocs[t] = 1.0 / len(selected_cryptos)
+
+    # ── Fetch price history ───────────────────────────────────────────────────
+    with st.spinner("Fetching crypto price history..."):
+        try:
+            raw = yf.download(selected_cryptos, period=period_map[hist_period],
+                              auto_adjust=True, progress=False)
+            if isinstance(raw.columns, pd.MultiIndex):
+                prices = raw["Close"]
+            else:
+                prices = raw
+            prices = prices.ffill().dropna(axis=1, how="all")
+        except Exception as e:
+            st.error(f"Data fetch failed: {e}")
+            st.stop()
+
+    if prices.empty or len(prices) < 30:
+        st.error("Not enough price history. Try a shorter period or different coins.")
+        st.stop()
+
+    # ── Per-coin stats ────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("Coin Statistics (Historical)")
+    returns = prices.pct_change().dropna()
+    stat_cols = st.columns(len(selected_cryptos))
+    for i, ticker in enumerate(selected_cryptos):
+        if ticker not in prices.columns:
+            continue
+        col  = prices[ticker].dropna()
+        rets = returns[ticker].dropna()
+        total_ret  = (col.iloc[-1] / col.iloc[0] - 1) * 100
+        ann_ret    = ((1 + total_ret/100) ** (365 / len(col)) - 1) * 100
+        ann_vol    = rets.std() * np.sqrt(365) * 100
+        max_dd     = ((col / col.cummax()) - 1).min() * 100
+        name = CRYPTO_UNIVERSE.get(ticker, ticker)
+        with stat_cols[i]:
+            color = "#00d4aa" if total_ret > 0 else "#ff4b4b"
+            st.markdown(f"**{name}**")
+            st.markdown(f'<span style="color:{color};font-size:1.3rem;font-weight:800">{total_ret:+.0f}%</span>', unsafe_allow_html=True)
+            st.caption(f"Ann: {ann_ret:+.0f}% | Vol: {ann_vol:.0f}% | MaxDD: {max_dd:.0f}%")
+
+    # ── Portfolio returns ─────────────────────────────────────────────────────
+    available = [t for t in selected_cryptos if t in returns.columns]
+    weights   = np.array([allocs[t] for t in available])
+    weights   = weights / weights.sum()
+    port_rets = returns[available].dot(weights)
+
+    mu    = float(port_rets.mean())
+    sigma = float(port_rets.std())
+    ann_vol_port = sigma * np.sqrt(365) * 100
+
+    # ── Run Monte Carlo ───────────────────────────────────────────────────────
+    st.divider()
+    st.subheader(f"Monte Carlo — {n_sims:,} Simulations × {days} Days")
+
+    rng  = np.random.default_rng(42)
+    sims = np.zeros((days, n_sims))
+    sims[0, :] = capital
+    daily_shocks = rng.normal(mu, sigma, size=(days - 1, n_sims))
+    for d in range(1, days):
+        sims[d, :] = sims[d-1, :] * (1 + daily_shocks[d-1, :])
+
+    p10  = float(np.percentile(sims[-1], 10))
+    p25  = float(np.percentile(sims[-1], 25))
+    p50  = float(np.percentile(sims[-1], 50))
+    p75  = float(np.percentile(sims[-1], 75))
+    p90  = float(np.percentile(sims[-1], 90))
+    prob_profit = float((sims[-1] > capital).mean() * 100)
+    prob_2x     = float((sims[-1] > capital * 2).mean() * 100)
+    prob_ruin   = float((sims[-1] < capital * 0.1).mean() * 100)
+
+    c1,c2,c3,c4,c5 = st.columns(5)
+    c1.metric("Bear Case (P10)",    f"${p10:,.2f}", f"{(p10-capital)/capital*100:+.1f}%")
+    c2.metric("Base Case (P50)",    f"${p50:,.2f}", f"{(p50-capital)/capital*100:+.1f}%")
+    c3.metric("Bull Case (P90)",    f"${p90:,.2f}", f"{(p90-capital)/capital*100:+.1f}%")
+    c4.metric("Prob. of Profit",    f"{prob_profit:.1f}%")
+    c5.metric("Ann. Volatility",    f"{ann_vol_port:.0f}%")
+
+    c1,c2,c3 = st.columns(3)
+    c1.metric("Prob. 2× Your Money", f"{prob_2x:.1f}%")
+    c2.metric("Prob. of Ruin (<10%)",f"{prob_ruin:.1f}%")
+    c3.metric("Portfolio Vol / Day", f"{sigma*100:.2f}%")
+
+    # ── Simulation chart ──────────────────────────────────────────────────────
+    x   = list(range(days))
+    fig = go.Figure()
+    show_every = max(1, n_sims // 120)
+    for i in range(0, n_sims, show_every):
+        fig.add_trace(go.Scatter(x=x, y=sims[:, i],
+                                 line=dict(width=0.3, color="rgba(0,212,170,0.07)"),
+                                 showlegend=False, hoverinfo="skip"))
+
+    band_c = {10:"#ff4b4b", 25:"#ff9900", 50:"#ffffff", 75:"#60aaff", 90:"#00d4aa"}
+    band_n = {10:"P10 Bear", 25:"P25", 50:"P50 Median", 75:"P75", 90:"P90 Bull"}
+    for pct in [10, 25, 50, 75, 90]:
+        vals = np.percentile(sims, pct, axis=1)
+        fig.add_trace(go.Scatter(x=x, y=vals, line=dict(width=2.5, color=band_c[pct]),
+                                 name=band_n[pct]))
+    fig.add_hline(y=capital, line_dash="dash", line_color="gray",
+                  annotation_text=f"Start ${capital:,.0f}")
+    fig.update_layout(template="plotly_dark", paper_bgcolor="#0e1117",
+                      plot_bgcolor="#0e1117", yaxis_title="Portfolio Value ($)",
+                      height=500, legend=dict(x=0.01, y=0.99))
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── Distribution histogram ────────────────────────────────────────────────
+    st.subheader("Final Value Distribution")
+    final_vals = sims[-1, :]
+    fig2 = go.Figure()
+    fig2.add_trace(go.Histogram(x=final_vals, nbinsx=100,
+                                marker_color="#00d4aa", opacity=0.75))
+    for pct, col, label in [(10,"#ff4b4b","P10"),(50,"#ffd700","P50"),(90,"#00d4aa","P90")]:
+        fig2.add_vline(x=np.percentile(final_vals, pct), line_dash="dot",
+                       line_color=col, annotation_text=label)
+    fig2.add_vline(x=capital, line_dash="dash", line_color="white",
+                   annotation_text="Start")
+    fig2.update_layout(template="plotly_dark", paper_bgcolor="#0e1117",
+                       plot_bgcolor="#0e1117", xaxis_title="Final Portfolio Value ($)",
+                       height=300)
+    st.plotly_chart(fig2, use_container_width=True)
+
+    # ── Percentile table ──────────────────────────────────────────────────────
+    rows = [{"Percentile": f"P{p}",
+             "Final Value": f"${np.percentile(final_vals,p):,.2f}",
+             "Return":      f"{(np.percentile(final_vals,p)-capital)/capital*100:+.1f}%",
+             "Multiple":    f"{np.percentile(final_vals,p)/capital:.2f}x"}
+            for p in [5, 10, 25, 50, 75, 90, 95]]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # ── Price chart of selected coins ─────────────────────────────────────────
+    st.divider()
+    st.subheader("Historical Price Performance (Normalised to $100)")
+    norm = prices[available].dropna()
+    norm = norm / norm.iloc[0] * 100
+    colors = ["#00d4aa","#60aaff","#ffd700","#ff9900","#ff4b4b","#c084fc","#f472b6","#34d399"]
+    fig3 = go.Figure()
+    for i, ticker in enumerate(available):
+        fig3.add_trace(go.Scatter(
+            x=norm.index, y=norm[ticker],
+            line=dict(width=2, color=colors[i % len(colors)]),
+            name=f"{CRYPTO_UNIVERSE.get(ticker,ticker)} ({ticker.replace('-USD','')})"
+        ))
+    fig3.add_hline(y=100, line_dash="dash", line_color="gray")
+    fig3.update_layout(template="plotly_dark", paper_bgcolor="#0e1117",
+                       plot_bgcolor="#0e1117", yaxis_title="Normalised Value",
+                       height=380)
+    st.plotly_chart(fig3, use_container_width=True)
+
+    st.caption("⚠️ Crypto is highly volatile. Monte Carlo simulations are educational only — not financial advice.")
 
 
 # ── Trade Log ─────────────────────────────────────────────────────────────────
